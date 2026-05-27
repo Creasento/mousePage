@@ -133,7 +133,10 @@ CSV_FIELDNAMES = [
     "point_index",
     "A",
     "W",
+    "ID",
+    "duration",
     "error",
+    "t_norm",
     "x_norm",
     "y_norm",
 ]
@@ -146,6 +149,7 @@ def iter_csv_rows(trial):
         yield {
             **trial_row,
             "point_index": point["index"],
+            "t_norm": point["t_norm"],
             "x_norm": point["x_norm"],
             "y_norm": point["y_norm"],
         }
