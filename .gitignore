@@ -1,0 +1,11 @@
+# Large data files
+*.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local environment
+.venv/
+venv/
+env/

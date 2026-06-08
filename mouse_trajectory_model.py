@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 
 
-GROUP_KEYS = ("subject", "subfolder", "condition_index", "trial_number")
+GROUP_KEYS = ("subject", "subfolder", "condition_index", "trial_number", "segment_index")
 COND_KEYS = ("A", "W", "ID", "duration")
 
 
@@ -162,6 +162,113 @@ def smoothness_loss(traj):
     return acceleration.pow(2).mean()
 
 
+def velocity_loss(pred, target):
+    pred_velocity = pred[:, 1:] - pred[:, :-1]
+    target_velocity = target[:, 1:] - target[:, :-1]
+    return F.mse_loss(pred_velocity, target_velocity)
+
+
+def acceleration_loss(pred, target):
+    pred_velocity = pred[:, 1:] - pred[:, :-1]
+    target_velocity = target[:, 1:] - target[:, :-1]
+    pred_acceleration = pred_velocity[:, 1:] - pred_velocity[:, :-1]
+    target_acceleration = target_velocity[:, 1:] - target_velocity[:, :-1]
+    return F.mse_loss(pred_acceleration, target_acceleration)
+
+
+def _mean_magnitude(values):
+    return torch.linalg.norm(values, dim=-1).mean(dim=1)
+
+
+def _relative_stat_loss(pred_values, target_values):
+    pred_mean = pred_values.mean()
+    target_mean = target_values.mean()
+    pred_std = pred_values.std(unbiased=False)
+    target_std = target_values.std(unbiased=False)
+    eps = 1e-6
+    mean_gap = ((pred_mean - target_mean) / (target_mean.abs() + eps)).pow(2)
+    std_gap = ((pred_std - target_std) / (target_std.abs() + eps)).pow(2)
+    return mean_gap + std_gap
+
+
+def acceleration_stat_loss(pred, target):
+    pred_velocity = pred[:, 1:] - pred[:, :-1]
+    target_velocity = target[:, 1:] - target[:, :-1]
+    pred_acceleration = pred_velocity[:, 1:] - pred_velocity[:, :-1]
+    target_acceleration = target_velocity[:, 1:] - target_velocity[:, :-1]
+    return _relative_stat_loss(
+        _mean_magnitude(pred_acceleration),
+        _mean_magnitude(target_acceleration),
+    )
+
+
+def jerk_stat_loss(pred, target):
+    pred_velocity = pred[:, 1:] - pred[:, :-1]
+    target_velocity = target[:, 1:] - target[:, :-1]
+    pred_acceleration = pred_velocity[:, 1:] - pred_velocity[:, :-1]
+    target_acceleration = target_velocity[:, 1:] - target_velocity[:, :-1]
+    pred_jerk = pred_acceleration[:, 1:] - pred_acceleration[:, :-1]
+    target_jerk = target_acceleration[:, 1:] - target_acceleration[:, :-1]
+    return _relative_stat_loss(
+        _mean_magnitude(pred_jerk),
+        _mean_magnitude(target_jerk),
+    )
+
+
+def deviation_stat_loss(pred, target):
+    return _relative_stat_loss(
+        pred[:, :, 1].abs().mean(dim=1),
+        target[:, :, 1].abs().mean(dim=1),
+    )
+
+
+def path_length_stat_loss(pred, target):
+    pred_steps = pred[:, 1:] - pred[:, :-1]
+    target_steps = target[:, 1:] - target[:, :-1]
+    return _relative_stat_loss(
+        torch.linalg.norm(pred_steps, dim=-1).sum(dim=1),
+        torch.linalg.norm(target_steps, dim=-1).sum(dim=1),
+    )
+
+
+def peak_velocity_stat_loss(pred, target):
+    pred_steps = pred[:, 1:] - pred[:, :-1]
+    target_steps = target[:, 1:] - target[:, :-1]
+    return _relative_stat_loss(
+        torch.linalg.norm(pred_steps, dim=-1).max(dim=1).values,
+        torch.linalg.norm(target_steps, dim=-1).max(dim=1).values,
+    )
+
+
+def _late_slice(values, ratio):
+    start = int(values.size(1) * (1.0 - ratio))
+    return values[:, max(0, start) :]
+
+
+def late_acceleration_stat_loss(pred, target, ratio=0.3):
+    pred_velocity = pred[:, 1:] - pred[:, :-1]
+    target_velocity = target[:, 1:] - target[:, :-1]
+    pred_acceleration = pred_velocity[:, 1:] - pred_velocity[:, :-1]
+    target_acceleration = target_velocity[:, 1:] - target_velocity[:, :-1]
+    return _relative_stat_loss(
+        torch.linalg.norm(_late_slice(pred_acceleration, ratio), dim=-1).mean(dim=1),
+        torch.linalg.norm(_late_slice(target_acceleration, ratio), dim=-1).mean(dim=1),
+    )
+
+
+def late_jerk_stat_loss(pred, target, ratio=0.3):
+    pred_velocity = pred[:, 1:] - pred[:, :-1]
+    target_velocity = target[:, 1:] - target[:, :-1]
+    pred_acceleration = pred_velocity[:, 1:] - pred_velocity[:, :-1]
+    target_acceleration = target_velocity[:, 1:] - target_velocity[:, :-1]
+    pred_jerk = pred_acceleration[:, 1:] - pred_acceleration[:, :-1]
+    target_jerk = target_acceleration[:, 1:] - target_acceleration[:, :-1]
+    return _relative_stat_loss(
+        torch.linalg.norm(_late_slice(pred_jerk, ratio), dim=-1).mean(dim=1),
+        torch.linalg.norm(_late_slice(target_jerk, ratio), dim=-1).mean(dim=1),
+    )
+
+
 def train(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -195,7 +302,29 @@ def train(args):
             pred, mu, logvar = model(cond, traj)
             recon = F.mse_loss(pred, traj)
             kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = recon + args.beta * kld + args.smooth_weight * smoothness_loss(pred)
+            vel = velocity_loss(pred, traj)
+            acc = acceleration_loss(pred, traj)
+            acc_stat = acceleration_stat_loss(pred, traj)
+            jerk_stat = jerk_stat_loss(pred, traj)
+            dev_stat = deviation_stat_loss(pred, traj)
+            path_stat = path_length_stat_loss(pred, traj)
+            peak_vel_stat = peak_velocity_stat_loss(pred, traj)
+            late_acc_stat = late_acceleration_stat_loss(pred, traj, args.late_ratio)
+            late_jerk_stat = late_jerk_stat_loss(pred, traj, args.late_ratio)
+            loss = (
+                recon
+                + args.beta * kld
+                + args.smooth_weight * smoothness_loss(pred)
+                + args.velocity_weight * vel
+                + args.acceleration_weight * acc
+                + args.acceleration_stat_weight * acc_stat
+                + args.jerk_stat_weight * jerk_stat
+                + args.deviation_stat_weight * dev_stat
+                + args.path_length_stat_weight * path_stat
+                + args.peak_velocity_stat_weight * peak_vel_stat
+                + args.late_acceleration_stat_weight * late_acc_stat
+                + args.late_jerk_stat_weight * late_jerk_stat
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -212,7 +341,29 @@ def train(args):
                 pred, mu, logvar = model(cond, traj)
                 recon = F.mse_loss(pred, traj)
                 kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = recon + args.beta * kld + args.smooth_weight * smoothness_loss(pred)
+                vel = velocity_loss(pred, traj)
+                acc = acceleration_loss(pred, traj)
+                acc_stat = acceleration_stat_loss(pred, traj)
+                jerk_stat = jerk_stat_loss(pred, traj)
+                dev_stat = deviation_stat_loss(pred, traj)
+                path_stat = path_length_stat_loss(pred, traj)
+                peak_vel_stat = peak_velocity_stat_loss(pred, traj)
+                late_acc_stat = late_acceleration_stat_loss(pred, traj, args.late_ratio)
+                late_jerk_stat = late_jerk_stat_loss(pred, traj, args.late_ratio)
+                loss = (
+                    recon
+                    + args.beta * kld
+                    + args.smooth_weight * smoothness_loss(pred)
+                    + args.velocity_weight * vel
+                    + args.acceleration_weight * acc
+                    + args.acceleration_stat_weight * acc_stat
+                    + args.jerk_stat_weight * jerk_stat
+                    + args.deviation_stat_weight * dev_stat
+                    + args.path_length_stat_weight * path_stat
+                    + args.peak_velocity_stat_weight * peak_vel_stat
+                    + args.late_acceleration_stat_weight * late_acc_stat
+                    + args.late_jerk_stat_weight * late_jerk_stat
+                )
                 val_loss += loss.item() * cond.size(0)
 
         if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
@@ -256,7 +407,7 @@ def normalized_to_screen(points, start, target):
 
 
 def generate(args):
-    checkpoint = torch.load(args.model, map_location="cpu")
+    checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
     seq_len = int(checkpoint["seq_len"])
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     model = TrajectoryCVAE(
@@ -311,6 +462,16 @@ def build_parser():
     train_parser.add_argument("--lr", type=float, default=1e-3)
     train_parser.add_argument("--beta", type=float, default=0.001)
     train_parser.add_argument("--smooth-weight", type=float, default=0.02)
+    train_parser.add_argument("--velocity-weight", type=float, default=0.0)
+    train_parser.add_argument("--acceleration-weight", type=float, default=0.0)
+    train_parser.add_argument("--acceleration-stat-weight", type=float, default=0.0)
+    train_parser.add_argument("--jerk-stat-weight", type=float, default=0.0)
+    train_parser.add_argument("--deviation-stat-weight", type=float, default=0.0)
+    train_parser.add_argument("--path-length-stat-weight", type=float, default=0.0)
+    train_parser.add_argument("--peak-velocity-stat-weight", type=float, default=0.0)
+    train_parser.add_argument("--late-acceleration-stat-weight", type=float, default=0.0)
+    train_parser.add_argument("--late-jerk-stat-weight", type=float, default=0.0)
+    train_parser.add_argument("--late-ratio", type=float, default=0.3)
     train_parser.add_argument("--latent-dim", type=int, default=16)
     train_parser.add_argument("--hidden-dim", type=int, default=128)
     train_parser.add_argument("--val-ratio", type=float, default=0.15)
